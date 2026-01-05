@@ -156,16 +156,24 @@ impl BitFile {
 }
 
 /// Equivalent to FilePrintBinary
-pub fn file_print_binary(file: &mut File, code: u32, bits: u32) -> io::Result<()> {
+/// Prints the binary representation of a code directly to stdout.
+pub fn file_print_binary_to_stdout(code: u32, bits: u32) -> io::Result<()> {
+    let mut out = stdout();
     if bits == 0 { return Ok(()); }
     let mut mask = 1u32 << (bits - 1);
     while mask != 0 {
         if (code & mask) != 0 {
-            file.write_all(b"1")?;
+            out.write_all(b"1")?;
         } else {
-            file.write_all(b"0")?;
+            out.write_all(b"0")?;
         }
         mask >>= 1;
     }
     Ok(())
+}
+
+impl BitFile {
+    pub fn get_file(&mut self) -> &mut File {
+        &mut self.file
+    }
 }

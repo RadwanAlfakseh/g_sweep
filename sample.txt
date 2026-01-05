@@ -1,0 +1,2 @@
+This file is used to test the logic of the compression and decompression.
+If everything goes well, after compressing and decompressing the text should be identical.
