@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 pub const END_OF_STREAM: usize = 256;
+const MAX_NODES: usize = 514;
 pub const COMPRESSION_NAME: &str = "static order 0 model with Huffman coding";
 pub const USAGE: &str = "infile outfile [-d]\n\nSpecifying -d will dump the modeling data\n";
 
@@ -10,8 +11,8 @@ pub const USAGE: &str = "infile outfile [-d]\n\nSpecifying -d will dump the mode
 pub struct Node {
     pub count: u32,
     pub saved_count: u32,
-    pub child_0: i32,
-    pub child_1: i32,
+    pub child_0: usize,
+    pub child_1: usize,
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -22,57 +23,70 @@ pub struct Code {
 
 // --- Header Logic ---
 
+
+// 0 | 1 | 2 | 3 | 4  | 5  | 6 | 7 | 8 | 9 | 10 |11 | 12 | 13 | 14 | 15  | 16  | 17 | 18 | .. | 256 | 257 | 258 | 259 | 260 | 261 | 262 | 263 | .... | 513
+// 0 | 0 | 0 | 0 | 0  | 0  | 0 | 0 | 0 | 0 | 0  | 0 | 0  | 0  | 0  | 0   | 0   | 0  | 0  | .. |  0  |  0  |  0  |  0  | 0   | 0   | 0   | 215 | .... | MAX
+
 fn output_counts(bit_file: &mut BitFile, nodes: &[Node]) -> io::Result<()> {
     let mut first: usize = 0;
-    while first < 255 && nodes[first].count == 0 {
+
+    // 1. Skip leading zeros
+    while first < 256 && nodes[first].count == 0 {
         first += 1;
     }
 
-    let mut f = first;
-    while f < 256 {
-        let mut last = f + 1;
+    // 2. Process runs
+    let mut current_first: usize = first;
+    while current_first < 256 {
+        let mut last: usize = current_first;
+        let mut next: usize = current_first + 1;
+
+        // Find the end of the current run
         loop {
-            while last < 256 && nodes[last].count != 0 {
+            // Find where non-zero data ends
+            while last < 255 && nodes[last + 1].count != 0 {
                 last += 1;
             }
-            last -= 1;
 
-            let mut next = last + 1;
+            // Look ahead: is there another non-zero count within 3 steps?
+            next = last + 1;
             while next < 256 && nodes[next].count == 0 {
                 next += 1;
             }
-            if next > 255 || (next - last) > 3 {
-                break;
+
+            // If the gap is small (<= 3), bridge it and keep the run going
+            if next < 256 && (next - last) <= 3 {
+                last = next;
+            } else {
+                break; // Gap too large or end of array
             }
-            last = next;
         }
 
-        // Write first, last, and the counts in between
-        // Accessing the internal file directly for byte-level header
-        let internal_file = &mut bit_file.get_file();
-        internal_file.write_all(&[f as u8, last as u8])?;
-        for i in f..=last {
-            internal_file.write_all(&[nodes[i].count as u8])?;
+        // 3. Write the Run Header (First, Last)
+        bit_file.get_file().write_all(&[current_first as u8])?;
+        bit_file.get_file().write_all(&[last as u8])?;
+
+        // 4. Write the counts for this run
+        for i in current_first..=last {
+            bit_file.get_file().write_all(&[nodes[i].count as u8])?;
         }
 
-        f = next_run_start(nodes, last + 1);
+        // 5. Move to the next run
+        current_first = next;
+        while current_first < 256 && nodes[current_first].count == 0 {
+            current_first += 1;
+        }
     }
-    bit_file.get_file().write_all(&[0])?; // Terminal 0
+
+    // 6. Write final zero to indicate end of runs
+    bit_file.get_file().write_all(&[0])?;
     Ok(())
-}
-
-fn next_run_start(nodes: &[Node], start_index: usize) -> usize {
-    let mut i = start_index;
-    while i < 256 && nodes[i].count == 0 {
-        i += 1;
-    }
-    i
 }
 
 // --- Tree Building ---
 
-pub fn build_tree(nodes: &mut [Node]) -> i32 {
-    nodes[513].count = 0xffff;
+pub fn build_tree(nodes: &mut [Node]) -> usize {
+    nodes[513].count = u32::MAX;
     let mut next_free = END_OF_STREAM + 1;
 
     loop {
@@ -95,37 +109,51 @@ pub fn build_tree(nodes: &mut [Node]) -> i32 {
         nodes[next_free].count = nodes[min_1].count + nodes[min_2].count;
         nodes[min_1].saved_count = nodes[min_1].count;
         nodes[min_1].count = 0;
+
         nodes[min_2].saved_count = nodes[min_2].count;
         nodes[min_2].count = 0;
-        nodes[next_free].child_0 = min_1 as i32;
-        nodes[next_free].child_1 = min_2 as i32;
+
+        nodes[next_free].child_0 = min_1;
+        nodes[next_free].child_1 = min_2;
+
         next_free += 1;
     }
-
-    (next_free - 1) as i32
+    let root_index = next_free -1;
+    nodes[root_index].saved_count = nodes[root_index].count;
+    root_index
 }
-
 pub fn convert_tree_to_code(
     nodes: &[Node],
     codes: &mut [Code],
     code_so_far: u32,
     bits: i32,
-    node: i32
+    node_index: usize
 ) {
-    if node <= END_OF_STREAM as i32 {
-        codes[node as usize].code = code_so_far;
-        codes[node as usize].code_bits = bits;
+    if node_index <= END_OF_STREAM  {
+        codes[node_index].code = code_so_far;
+        codes[node_index].code_bits = bits;
         return;
     }
-    let n = nodes[node as usize];
-    convert_tree_to_code(nodes, codes, code_so_far << 1, bits + 1, n.child_0);
-    convert_tree_to_code(nodes, codes, (code_so_far << 1) | 1, bits + 1, n.child_1);
+    let next_bit = bits + 1;
+    let left_child_node = nodes[node_index].child_0;
+    convert_tree_to_code(nodes,
+                         codes,
+                         code_so_far << 1,
+                         next_bit,
+                         left_child_node);
+
+    let right_child_node = nodes[node_index].child_1;
+    convert_tree_to_code(nodes,
+                         codes,
+                         (code_so_far << 1) | 1,
+                         next_bit,
+                         right_child_node);
 }
 
 /// High-level compression routine
 pub fn compress_file(mut input: File, output: &mut BitFile, argc: i32, argv: Vec<String>) -> io::Result<()> {
     let mut counts = vec![0u64; 256];
-    let mut nodes = vec![Node::default(); 514];
+    let mut nodes = vec![Node::default(); MAX_NODES];
     let mut codes = vec![Code::default(); 257];
 
     // 1. Count bytes in the file
@@ -186,18 +214,18 @@ pub fn compress_data(mut input: File, output: &mut BitFile, codes: &[Code]) -> i
     Ok(())
 }
 
-pub fn expand_data(input: &mut BitFile, mut output: File, nodes: &[Node], root_node: i32) -> io::Result<()> {
+pub fn expand_data(input: &mut BitFile, mut output: File, nodes: &[Node], root_node: usize) -> io::Result<()> {
     loop {
         let mut node = root_node;
-        while node > END_OF_STREAM as i32 {
+        while node > END_OF_STREAM {
             if input.input_bit()? != 0 {
-                node = nodes[node as usize].child_1;
+                node = nodes[node].child_1;
             } else {
-                node = nodes[node as usize].child_0;
+                node = nodes[node].child_0;
             }
         }
 
-        if node == END_OF_STREAM as i32 {
+        if node == END_OF_STREAM {
             break;
         }
 
@@ -221,15 +249,22 @@ fn count_bytes(input: &mut File, counts: &mut [u64]) -> io::Result<()> {
 }
 
 fn scale_counts(counts: &[u64], nodes: &mut [Node]) {
-    let max_count = counts.iter().max().cloned().unwrap_or(0);
+    let mut max_count = *counts.iter().max().unwrap_or(&0);
 
+    if max_count == 0 {
+        max_count = 1;
+    }
     // Scale factor: ensures max value fits in a byte (1-255)
     let scale = (max_count / 255) + 1;
 
     for i in 0..256 {
-        nodes[i].count = (counts[i] / scale) as u32;
-        if nodes[i].count == 0 && counts[i] != 0 {
+        let scale_value = counts[i] / scale;
+
+        if scale_value == 0 && counts[i] != 0 {
             nodes[i].count = 1;
+        }
+        else {
+            nodes[i].count = scale_value as u32;
         }
     }
     nodes[END_OF_STREAM].count = 1;
@@ -271,7 +306,7 @@ fn print_model(nodes: &[Node], codes: &[Code]) {
     for i in 0..513 {
         if nodes[i].saved_count != 0 {
             print!("node=");
-            print_char(i as i32);
+            print_char(i);
             print!(" count={:3} child_0=", nodes[i].saved_count);
             print_char(nodes[i].child_0);
             print!(" child_1=");
@@ -287,7 +322,7 @@ fn print_model(nodes: &[Node], codes: &[Code]) {
     }
 }
 
-fn print_char(c: i32) {
+fn print_char(c: usize) {
     if c >= 0x20 && c < 127 {
         print!("'{}'", c as u8 as char);
     } else {
